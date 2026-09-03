@@ -14,6 +14,7 @@
 - `output_image`: GetLatestFrame/callback 的默认输出图像描述
   - `format/width/height` 为空(0 或 Unknown)表示保持硬件原始输出(通常 NV12 + 原始分辨率)
 - `device_id`: AXCL 下建议显式指定；板端通常保持 `-1`
+- `callback_queue_capacity`: `kQueue` 模式的有界容量，只允许 1–8，默认 8
 
 ## 输入
 
@@ -63,9 +64,11 @@ decoder->SetFrameCallback([](axvsdk::common::AxImage::Ptr frame) {
 - `kLatest`: 回调线程只保留最新帧(慢回调时中间帧丢弃)
 - `kQueue`: 内部有界队列按顺序投递(慢回调时丢弃最旧帧，避免阻塞解码)
 
+`GetStats()` 返回 VDEC 实际接收、callback 入队/投递/drop-oldest、当前深度和最高水位。
+Stop/Close 会清空待投递引用并等待 callback worker 退出。
+
 ## 平台差异与能力边界(摘要)
 
 - 解码输出原生通常为 NV12。
 - AX620E 系列的解码能力依赖具体芯片与驱动；例如部分平台可能只支持 H.264 解码。
 - AXCL 设备侧图像默认在卡上；如需 host 访问需要显式拷贝。
-

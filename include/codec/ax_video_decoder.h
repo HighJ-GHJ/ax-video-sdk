@@ -1,3 +1,4 @@
+// 文件说明：声明视频解码器、有界回调队列配置及精确投递统计。
 #pragma once
 
 #include <cstddef>
@@ -21,6 +22,17 @@ struct VideoDecoderConfig {
     common::ImageDescriptor output_image{};
     // 设备索引。AXCL 下建议显式指定；板端通常保持默认值即可。
     std::int32_t device_id{-1};
+    // kQueue 回调的有界容量；仅接受 1..8，默认 8。
+    std::size_t callback_queue_capacity{8};
+};
+
+struct VideoDecoderStats {
+    std::uint64_t received_frames{0};
+    std::uint64_t callback_enqueued_frames{0};
+    std::uint64_t callback_delivered_frames{0};
+    std::uint64_t callback_dropped_frames{0};
+    std::size_t callback_queue_depth{0};
+    std::size_t callback_queue_high_watermark{0};
 };
 
 using FrameCallback = std::function<void(common::AxImage::Ptr frame)>;
@@ -63,6 +75,7 @@ public:
     // 高级接口：选择回调帧投递策略。
     // 默认 kLatest 更符合 “获取最新一帧” 语义；pipeline 需要完整帧序列时可用 kQueue。
     virtual void SetFrameCallback(FrameCallback callback, FrameCallbackMode mode) = 0;
+    virtual VideoDecoderStats GetStats() const = 0;
 };
 
 std::unique_ptr<VideoDecoder> CreateVideoDecoder();

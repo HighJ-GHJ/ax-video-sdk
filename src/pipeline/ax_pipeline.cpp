@@ -1,3 +1,4 @@
+// 文件说明：实现 Demux、VDEC 与回调有界 FIFO 的 Pipeline 生命周期。
 #include "pipeline/ax_pipeline.h"
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include "codec/ax_video_encoder.h"
 #include "ax_image_copy.h"
 #include "ax_image_internal.h"
+#include "bounded_callback_buffer.h"
 #include "ax_drawer_internal.h"
 #include "common/ax_drawer.h"
 #include "common/ax_image.h"
@@ -167,7 +169,8 @@ public:
             Close();
         }
 
-        if (config.input.uri.empty()) {
+        if (config.input.uri.empty() || config.frame_output.callback_queue_capacity == 0U ||
+            config.frame_output.callback_queue_capacity > 8U) {
             return false;
         }
 
@@ -195,6 +198,7 @@ public:
         codec::VideoDecoderConfig decoder_config{};
         decoder_config.stream = input_stream;
         decoder_config.device_id = config.device_id;
+        decoder_config.callback_queue_capacity = 8U;
         if (!decoder->Open(decoder_config)) {
             return false;
         }
@@ -296,7 +300,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> callback_lock(frame_callback_mutex_);
-            pending_callback_source_frame_.reset();
+            callback_frames_.Reset();
         }
         {
             std::lock_guard<std::mutex> processor_lock(frame_processor_mutex_);
@@ -319,6 +323,9 @@ public:
         drawer_ = common::internal::CreatePlatformDrawer();
         decoded_frames_.store(0, std::memory_order_relaxed);
         branch_submit_failures_.store(0, std::memory_order_relaxed);
+        callback_enqueued_frames_.store(0, std::memory_order_relaxed);
+        callback_delivered_frames_.store(0, std::memory_order_relaxed);
+        callback_dropped_frames_.store(0, std::memory_order_relaxed);
         demux_stop_ = false;
         open_ = true;
 
@@ -369,7 +376,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> callback_lock(frame_callback_mutex_);
-            pending_callback_source_frame_.reset();
+            callback_frames_.Clear();
             frame_callback_ = {};
         }
         {
@@ -394,7 +401,7 @@ public:
 
         {
             std::lock_guard<std::mutex> callback_lock(frame_callback_mutex_);
-            pending_callback_source_frame_.reset();
+            callback_frames_.Clear();
         }
         callback_stop_ = false;
         frame_callback_thread_ = std::thread(&AxPipeline::FrameCallbackLoop, this);
@@ -472,7 +479,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> callback_lock(frame_callback_mutex_);
-            pending_callback_source_frame_.reset();
+            callback_frames_.Clear();
         }
 
         {
@@ -532,9 +539,7 @@ public:
     void SetFrameCallback(FrameCallback callback) override {
         std::lock_guard<std::mutex> lock(frame_callback_mutex_);
         frame_callback_ = std::move(callback);
-        if (!frame_callback_) {
-            pending_callback_source_frame_.reset();
-        }
+        if (!frame_callback_) callback_frames_.Clear();
     }
 
     bool SetOsd(const common::DrawFrame& osd) override {
@@ -570,6 +575,16 @@ public:
         PipelineStats stats{};
         stats.decoded_frames = decoded_frames_.load(std::memory_order_relaxed);
         stats.branch_submit_failures = branch_submit_failures_.load(std::memory_order_relaxed);
+        stats.decoder_stats = decoder_ ? decoder_->GetStats() : codec::VideoDecoderStats{};
+        stats.callback_enqueued_frames = callback_enqueued_frames_.load(std::memory_order_relaxed);
+        stats.callback_delivered_frames = callback_delivered_frames_.load(std::memory_order_relaxed);
+        stats.callback_dropped_frames = callback_dropped_frames_.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> callback_lock(frame_callback_mutex_);
+            stats.callback_queue_depth = callback_frames_.Depth(
+                config_.frame_output.callback_delivery == FrameCallbackDelivery::kFifoDropOldest);
+            stats.callback_queue_high_watermark = callback_frames_.high_watermark();
+        }
         {
             std::lock_guard<std::mutex> lock(branches_mutex_);
             stats.output_stats.reserve(branches_.size());
@@ -742,7 +757,7 @@ private:
     void StopFrameCallbackThread() noexcept {
         {
             std::lock_guard<std::mutex> lock(frame_callback_mutex_);
-            pending_callback_source_frame_.reset();
+            callback_frames_.Clear();
             callback_stop_ = true;
         }
         frame_callback_cv_.notify_all();
@@ -986,15 +1001,16 @@ private:
             {
                 std::unique_lock<std::mutex> lock(frame_callback_mutex_);
                 frame_callback_cv_.wait(lock, [this] {
-                    return callback_stop_ || pending_callback_source_frame_ != nullptr;
+                    return callback_stop_ || !callback_frames_.empty();
                 });
 
-                if (callback_stop_ && pending_callback_source_frame_ == nullptr) {
+                if (callback_stop_ && callback_frames_.empty()) {
                     return;
                 }
 
                 callback = frame_callback_;
-                source_frame = std::move(pending_callback_source_frame_);
+                source_frame = callback_frames_.Pop(
+                    config_.frame_output.callback_delivery == FrameCallbackDelivery::kFifoDropOldest);
             }
 
             if (!callback || !source_frame) {
@@ -1010,6 +1026,7 @@ private:
             // This avoids per-frame CMM allocations and improves AXCL/NPU performance.
             if (SameDescriptor(output_descriptor, source_frame->descriptor())) {
                 callback(std::move(source_frame));
+                callback_delivered_frames_.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
@@ -1019,6 +1036,7 @@ private:
             auto callback_frame = CreateFrameCopy(*source_frame, request);
             if (callback_frame) {
                 callback(std::move(callback_frame));
+                callback_delivered_frames_.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -1038,7 +1056,14 @@ private:
         {
             std::lock_guard<std::mutex> lock(frame_callback_mutex_);
             if (frame_callback_) {
-                pending_callback_source_frame_ = source_frame;
+                callback_enqueued_frames_.fetch_add(1, std::memory_order_relaxed);
+                if (callback_frames_.Push(
+                        source_frame,
+                        config_.frame_output.callback_delivery ==
+                            FrameCallbackDelivery::kFifoDropOldest,
+                        config_.frame_output.callback_queue_capacity)) {
+                    callback_dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+                }
                 frame_callback_cv_.notify_one();
             }
         }
@@ -1091,14 +1116,17 @@ private:
     std::atomic<bool> callback_stop_{false};
     std::atomic<std::uint64_t> decoded_frames_{0};
     std::atomic<std::uint64_t> branch_submit_failures_{0};
+    std::atomic<std::uint64_t> callback_enqueued_frames_{0};
+    std::atomic<std::uint64_t> callback_delivered_frames_{0};
+    std::atomic<std::uint64_t> callback_dropped_frames_{0};
 
     mutable std::mutex frame_mutex_;
     common::AxImage::Ptr latest_source_frame_;
 
-    std::mutex frame_callback_mutex_;
+    mutable std::mutex frame_callback_mutex_;
     std::condition_variable frame_callback_cv_;
     FrameCallback frame_callback_;
-    common::AxImage::Ptr pending_callback_source_frame_;
+    common::internal::BoundedCallbackBuffer<common::AxImage::Ptr> callback_frames_;
     std::thread demux_thread_;
     std::thread frame_callback_thread_;
 

@@ -1,3 +1,4 @@
+// 文件说明：实现 AX 图像像素复制，并在成功后保持源帧时间元数据。
 #include "ax_image_copy.h"
 
 #include <cstddef>
@@ -478,8 +479,12 @@ bool CopyVideoFrameToImage(const AX_VIDEO_FRAME_INFO_T& frame_info, AxImage* des
             ByteStrideFromAxPicStride(source_descriptor.format, frame_info.stVFrame.u32PicStride[plane]);
     }
 
-    return CopyImageImpl(source_descriptor, &frame_info.stVFrame, source_phy_addrs, source_vir_addrs,
-                         source_strides, destination);
+    if (!CopyImageImpl(source_descriptor, &frame_info.stVFrame, source_phy_addrs, source_vir_addrs,
+                       source_strides, destination)) {
+        return false;
+    }
+    AxImageAccess::SetFrameTiming(destination, FrameTiming{true, frame_info.stVFrame.u64PTS});
+    return true;
 }
 
 }  // namespace axvsdk::common::internal

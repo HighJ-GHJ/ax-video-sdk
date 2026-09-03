@@ -1,3 +1,4 @@
+// 文件说明：声明媒体 Pipeline、回调投递策略和逐级精确统计。
 #pragma once
 
 #include <cstdint>
@@ -8,11 +9,19 @@
 
 #include "common/ax_drawer.h"
 #include "common/ax_image_processor.h"
+#include "codec/ax_video_decoder.h"
 #include "codec/ax_video_encoder.h"
 #include "pipeline/ax_demuxer.h"
 #include "pipeline/ax_muxer.h"
 
 namespace axvsdk::pipeline {
+
+enum class FrameCallbackDelivery {
+    // 只保留最新帧，与历史 Pipeline 行为一致。
+    kLatest = 0,
+    // 有界 FIFO 顺序投递；队列满时丢弃最老帧，不反压解码。
+    kFifoDropOldest,
+};
 
 // pipeline 输入由 URI 自动识别，通常无需调用方手工指定类型。
 using PipelineInputConfig = DemuxerConfig;
@@ -45,6 +54,9 @@ struct PipelineFrameOutputConfig {
     common::ImageDescriptor output_image{};
     // frame output 的缩放策略。
     common::ResizeOptions resize{};
+    FrameCallbackDelivery callback_delivery{FrameCallbackDelivery::kLatest};
+    // 只允许 1..8；Latest 模式始终只保留 1 帧。
+    std::size_t callback_queue_capacity{1};
 };
 
 struct PipelineConfig {
@@ -58,8 +70,15 @@ struct PipelineConfig {
 };
 
 struct PipelineStats {
+    // 保留旧字段：表示 Decoder callback 已交给 Pipeline 的帧数。
     std::uint64_t decoded_frames{0};
     std::uint64_t branch_submit_failures{0};
+    codec::VideoDecoderStats decoder_stats{};
+    std::uint64_t callback_enqueued_frames{0};
+    std::uint64_t callback_delivered_frames{0};
+    std::uint64_t callback_dropped_frames{0};
+    std::size_t callback_queue_depth{0};
+    std::size_t callback_queue_high_watermark{0};
     std::vector<codec::VideoEncoderStats> output_stats;
 };
 

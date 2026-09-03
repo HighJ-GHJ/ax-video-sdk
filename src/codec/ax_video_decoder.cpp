@@ -1,3 +1,4 @@
+// 文件说明：实现 AX 视频解码线程、有界回调投递和资源回收。
 #include "ax_video_decoder_internal.h"
 
 #include <algorithm>
@@ -32,8 +33,6 @@ namespace axvsdk::codec::internal {
 namespace {
 
 constexpr std::size_t kDecodeInputQueueDepth = 16;
-constexpr std::size_t kCallbackQueueDepth = 8;  // non-blocking; drop oldest when slow consumer
-
 common::ImageDescriptor MakeNativeOutputDescriptor(const Mp4VideoInfo& video_info) noexcept {
     common::ImageDescriptor descriptor{};
     descriptor.format = common::PixelFormat::kNv12;
@@ -67,7 +66,8 @@ bool AxVideoDecoderBase::Open(const VideoDecoderConfig& config) {
 
     config_ = config;
     if ((config.stream.codec != VideoCodecType::kH264 && config.stream.codec != VideoCodecType::kH265) ||
-        config.stream.width == 0 || config.stream.height == 0) {
+        config.stream.width == 0 || config.stream.height == 0 ||
+        config.callback_queue_capacity == 0U || config.callback_queue_capacity > 8U) {
         return false;
     }
 
@@ -88,6 +88,14 @@ bool AxVideoDecoderBase::Open(const VideoDecoderConfig& config) {
     }
     send_finished_ = false;
     callback_stop_ = false;
+    received_frames_.store(0, std::memory_order_relaxed);
+    callback_enqueued_frames_.store(0, std::memory_order_relaxed);
+    callback_delivered_frames_.store(0, std::memory_order_relaxed);
+    callback_dropped_frames_.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        callback_frames_.Reset();
+    }
     open_ = true;
     return true;
 }
@@ -106,8 +114,7 @@ void AxVideoDecoderBase::Close() noexcept {
         }
         {
             std::lock_guard<std::mutex> lock(callback_mutex_);
-            pending_callback_frame_.reset();
-            callback_queue_.clear();
+            callback_frames_.Clear();
             frame_callback_ = {};
             callback_mode_ = FrameCallbackMode::kLatest;
         }
@@ -158,7 +165,12 @@ void AxVideoDecoderBase::Stop() noexcept {
 
     StopBackend();
 
-    callback_stop_ = true;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        // Stop 是中止语义：不在关闭阶段继续回调业务，并立即释放 pool 帧引用。
+        callback_frames_.Clear();
+        callback_stop_ = true;
+    }
     callback_cv_.notify_all();
     if (callback_thread_.joinable()) {
         callback_thread_.join();
@@ -230,9 +242,23 @@ void AxVideoDecoderBase::SetFrameCallback(FrameCallback callback, FrameCallbackM
     std::lock_guard<std::mutex> lock(callback_mutex_);
     frame_callback_ = std::move(callback);
     callback_mode_ = mode;
-    pending_callback_frame_.reset();
-    callback_queue_.clear();
+    callback_frames_.Clear();
     callback_cv_.notify_all();
+}
+
+VideoDecoderStats AxVideoDecoderBase::GetStats() const {
+    VideoDecoderStats stats{};
+    stats.received_frames = received_frames_.load(std::memory_order_relaxed);
+    stats.callback_enqueued_frames = callback_enqueued_frames_.load(std::memory_order_relaxed);
+    stats.callback_delivered_frames = callback_delivered_frames_.load(std::memory_order_relaxed);
+    stats.callback_dropped_frames = callback_dropped_frames_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        stats.callback_queue_depth =
+            callback_frames_.Depth(callback_mode_ == FrameCallbackMode::kQueue);
+        stats.callback_queue_high_watermark = callback_frames_.high_watermark();
+    }
+    return stats;
 }
 
 const Mp4VideoInfo& AxVideoDecoderBase::video_info() const noexcept {
@@ -304,6 +330,7 @@ void AxVideoDecoderBase::ReceiveLoop() {
             }
             continue;
         }
+        received_frames_.fetch_add(1, std::memory_order_relaxed);
 
         // Some firmwares return macroblock-aligned coded dimensions in u32Width/u32Height but
         // don't populate crop fields. Preserve the "real" stream geometry for downstream modules
@@ -330,26 +357,20 @@ void AxVideoDecoderBase::CallbackLoop() {
         {
             std::unique_lock<std::mutex> lock(callback_mutex_);
             callback_cv_.wait(lock, [this] {
-                return callback_stop_ || pending_callback_frame_ != nullptr || !callback_queue_.empty();
+                return callback_stop_ || !callback_frames_.empty();
             });
 
-            if (callback_stop_ && pending_callback_frame_ == nullptr && callback_queue_.empty()) {
+            if (callback_stop_ && callback_frames_.empty()) {
                 return;
             }
 
             callback = frame_callback_;
-            if (callback_mode_ == FrameCallbackMode::kLatest) {
-                frame = std::move(pending_callback_frame_);
-            } else {
-                if (!callback_queue_.empty()) {
-                    frame = std::move(callback_queue_.front());
-                    callback_queue_.pop_front();
-                }
-            }
+            frame = callback_frames_.Pop(callback_mode_ == FrameCallbackMode::kQueue);
         }
 
         if (callback && frame) {
             callback(std::move(frame));
+            callback_delivered_frames_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
@@ -415,13 +436,11 @@ void AxVideoDecoderBase::PublishFrame(const AX_VIDEO_FRAME_INFO_T& frame_info) {
     {
         std::lock_guard<std::mutex> lock(callback_mutex_);
         if (frame_callback_) {
-            if (callback_mode_ == FrameCallbackMode::kLatest) {
-                pending_callback_frame_ = published_frame;
-            } else {
-                callback_queue_.push_back(published_frame);
-                if (callback_queue_.size() > kCallbackQueueDepth) {
-                    callback_queue_.pop_front();
-                }
+            callback_enqueued_frames_.fetch_add(1, std::memory_order_relaxed);
+            if (callback_frames_.Push(published_frame,
+                                      callback_mode_ == FrameCallbackMode::kQueue,
+                                      config_.callback_queue_capacity)) {
+                callback_dropped_frames_.fetch_add(1, std::memory_order_relaxed);
             }
             callback_cv_.notify_one();
         }

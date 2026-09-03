@@ -1,3 +1,4 @@
+// 文件说明：实现 AxImage 内存所有权、AX 帧包装和只读媒体时间元数据。
 #include "common/ax_image.h"
 #include "ax_image_internal.h"
 #include "ax_system_internal.h"
@@ -190,6 +191,7 @@ struct AxImage::Impl {
     std::array<void*, kMaxImagePlanes> virtual_addresses{};
     std::array<std::uint32_t, kMaxImagePlanes> block_ids{};
     AX_VIDEO_FRAME_INFO_T frame_info{};
+    FrameTiming timing{};
     internal::AxImageAccess::FrameReleaseCallback release_callback;
     std::shared_ptr<void> lifetime_holder;
 
@@ -466,6 +468,8 @@ AxImage::Ptr internal::AxImageAccess::WrapVideoFrame(const AX_VIDEO_FRAME_INFO_T
     impl->cache_mode = CacheMode::kNonCached;
     impl->owns_memory = false;
     impl->frame_info = frame_info;
+    // VDEC 输出的 u64PTS 来自提交给解码器的 packet；0 是合法首帧值。
+    impl->timing = FrameTiming{true, frame_info.stVFrame.u64PTS};
     // Ensure crop fields are non-zero and consistent with the visible descriptor. This helps
     // downstream modules keep correct UV offsets and picture ordering when padding is present.
     if (impl->frame_info.stVFrame.s16CropWidth <= 0 || impl->frame_info.stVFrame.s16CropHeight <= 0) {
@@ -560,6 +564,10 @@ MemoryType AxImage::memory_type() const noexcept {
 
 CacheMode AxImage::cache_mode() const noexcept {
     return impl_->cache_mode;
+}
+
+FrameTiming AxImage::timing() const noexcept {
+    return impl_->timing;
 }
 
 std::uint64_t AxImage::physical_address(std::size_t plane_index) const noexcept {
@@ -662,6 +670,22 @@ void internal::AxImageAccess::AttachLifetime(AxImage* image, std::shared_ptr<voi
     image->impl_->lifetime_holder = std::move(lifetime);
 }
 
+void internal::AxImageAccess::SetFrameTiming(AxImage* image, FrameTiming timing) noexcept {
+    if (image == nullptr) {
+        return;
+    }
+    image->impl_->timing = timing;
+}
+
+void internal::AxImageAccess::CopyFrameTiming(const AxImage& source,
+                                              AxImage* destination) noexcept {
+    if (destination == nullptr) return;
+    destination->impl_->timing = source.impl_->timing;
+    destination->impl_->frame_info.stVFrame.u64PTS = source.impl_->frame_info.stVFrame.u64PTS;
+    destination->impl_->frame_info.stVFrame.u32TimeRef = source.impl_->frame_info.stVFrame.u32TimeRef;
+    destination->impl_->frame_info.stVFrame.u64SeqNum = source.impl_->frame_info.stVFrame.u64SeqNum;
+}
+
 void internal::AxImageAccess::CopyFrameMetadata(const AxImage& source, AxImage* destination) noexcept {
     if (destination == nullptr) {
         return;
@@ -677,11 +701,9 @@ void internal::AxImageAccess::CopyFrameMetadata(const AxImage& source, AxImage* 
     dst->stVFrame.s16CropY = src.stVFrame.s16CropY;
     dst->stVFrame.s16CropWidth = src.stVFrame.s16CropWidth;
     dst->stVFrame.s16CropHeight = src.stVFrame.s16CropHeight;
-    dst->stVFrame.u32TimeRef = src.stVFrame.u32TimeRef;
-    dst->stVFrame.u64PTS = src.stVFrame.u64PTS;
-    dst->stVFrame.u64SeqNum = src.stVFrame.u64SeqNum;
     dst->stVFrame.u64UserData = src.stVFrame.u64UserData;
     dst->stVFrame.u32FrameFlag = src.stVFrame.u32FrameFlag;
+    CopyFrameTiming(source, destination);
 }
 
 }  // namespace axvsdk::common

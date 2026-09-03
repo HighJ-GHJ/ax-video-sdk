@@ -15,7 +15,7 @@
 - `device_id`: AXCL 下建议显式指定；一个 pipeline 只绑定一张卡
 - `input`: `DemuxerConfig`(URI 自动识别 MP4/RTSP)
 - `outputs`: N 路输出，每路一个 `PipelineOutputConfig`
-- `frame_output`: 控制 `GetLatestFrame` / frame callback 的输出格式/尺寸/缩放策略
+- `frame_output`: 控制 `GetLatestFrame` / frame callback 的输出格式、尺寸、缩放及投递策略
 
 `PipelineOutputConfig` 常用字段:
 
@@ -33,6 +33,9 @@
   - 只有在你取帧时才会做必要的拷贝/缩放/格式转换
 - `SetFrameCallback(cb)`:
   - 只有注册回调时，pipeline 才会为回调准备额外输出图像
+  - 默认 `kLatest` 保持历史行为；`kFifoDropOldest` 按序投递，容量只允许 1–8
+  - FIFO 满时释放最老帧并接纳新帧，不反压 VDEC
+  - Stop/Close 会清空待投递帧并等待 callback worker 退出
 
 ## OSD
 
@@ -47,5 +50,6 @@
 
 - `decoded_frames`
 - `branch_submit_failures`
+- Decoder callback 的接收、入队、投递、drop-oldest、当前深度和最高水位
+- Pipeline callback 的入队、投递、drop-oldest、当前深度和最高水位
 - 每路输出 `VideoEncoderStats`
-

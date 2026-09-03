@@ -10,6 +10,10 @@
 - 宽高与 stride(`ImageDescriptor`)
 - 底层内存来源(`MemoryType`)
 - 物理/虚拟地址与(可选) block id
+- 只读媒体时间(`FrameTiming`)；`pts_valid=true` 时 `pts_us=0` 仍是合法值
+
+VDEC 输出会携带提交 packet 对应的 PTS；图像复制、格式转换和 IVPS 处理成功后，输出图像继承
+输入图像的时间元数据。`Create`/`WrapExternal` 默认没有有效 PTS，公共 API 不提供修改入口。
 
 ## 像素格式
 
@@ -85,4 +89,3 @@ auto img = AxImage::WrapExternal(d, planes, holder);
 - cached 内存需要配合:
   - CPU 写完后送硬件: `FlushCache()`
   - 硬件写完后 CPU 读: `InvalidateCache()`
-

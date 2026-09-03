@@ -1,3 +1,4 @@
+// 文件说明：声明 AX 图像所有权、像素布局以及只读媒体时间元数据。
 #pragma once
 
 #include <array>
@@ -77,6 +78,13 @@ struct ExternalImagePlane {
     std::uint32_t block_id{kInvalidPoolId};
 };
 
+// 图像对应的媒体时间。pts_us == 0 也可以是有效的首帧时间戳，
+// 因此使用时必须同时检查 pts_valid。
+struct FrameTiming {
+    bool pts_valid{false};
+    std::uint64_t pts_us{0};
+};
+
 class AxImage {
 public:
     using Ptr = std::shared_ptr<AxImage>;
@@ -112,6 +120,8 @@ public:
     const ImageDescriptor& descriptor() const noexcept;
     MemoryType memory_type() const noexcept;
     CacheMode cache_mode() const noexcept;
+    // 返回只读媒体时间；调用方不能修改底层 AX 帧元数据。
+    FrameTiming timing() const noexcept;
 
     std::uint64_t physical_address(std::size_t plane_index) const noexcept;
     void* virtual_address(std::size_t plane_index) noexcept;

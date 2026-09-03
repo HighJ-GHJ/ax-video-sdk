@@ -1,4 +1,7 @@
+// 文件说明：实现 MP4/RTSP 解复用、重连和媒体 PTS 归一化。
 #include "pipeline/ax_demuxer.h"
+
+#include "rtsp_pts_unwrapper.h"
 
 #include <algorithm>
 #include <atomic>
@@ -390,18 +393,6 @@ bool EndsWithIgnoreCase(const std::string& value, const std::string& suffix) {
     return ToLowerCopy(value.substr(value.size() - suffix.size())) == ToLowerCopy(suffix);
 }
 
-std::uint64_t ToMicroseconds(std::uint64_t value, std::uint32_t timescale, double fps_fallback) noexcept {
-    if (timescale != 0U) {
-        return value * 1000000ULL / timescale;
-    }
-    if (fps_fallback > 0.0) {
-        const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::duration<double>(static_cast<double>(value) / fps_fallback));
-        return static_cast<std::uint64_t>(std::max<std::int64_t>(duration.count(), 0));
-    }
-    return value;
-}
-
 bool ShouldOverrideStreamSize(std::uint32_t current_w,
                               std::uint32_t current_h,
                               std::uint32_t probed_w,
@@ -574,7 +565,7 @@ public:
             if (rtsp_client_.receiveFrame(frame, 200)) {
                 last_rtsp_frame_ = now;
                 packet->codec = stream_info_.codec;
-                packet->pts = frame.pts * 1000ULL;
+                packet->pts = rtsp_pts_unwrapper_.Normalize(frame.pts).pts_us;
                 packet->duration = frame.fps > 0
                                        ? (1000000ULL / static_cast<std::uint64_t>(frame.fps))
                                        : (stream_info_.frame_rate > 0.0
@@ -758,6 +749,9 @@ private:
             return false;
         }
 
+        // 新 RTSP 会话的 RTP 时间基可能从任意值重新开始。
+        rtsp_pts_unwrapper_.Reset();
+
         return true;
     }
 
@@ -859,6 +853,7 @@ private:
     std::uint64_t emitted_pts_cursor_us_{0};
 
     rtsp::RtspClient rtsp_client_;
+    internal::RtspPtsUnwrapper rtsp_pts_unwrapper_;
     rtsp::SessionInfo rtsp_session_{};
     std::vector<std::uint8_t> rtsp_decoder_prefix_;
     bool rtsp_decoder_config_sent_{false};

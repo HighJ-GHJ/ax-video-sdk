@@ -1,3 +1,4 @@
+// 文件说明：声明 AX 视频解码公共实现的线程、队列和统计状态。
 #pragma once
 
 #include <atomic>
@@ -11,6 +12,7 @@
 #include "ax_global_type.h"
 
 #include "codec/ax_video_decoder.h"
+#include "bounded_callback_buffer.h"
 
 namespace axvsdk::codec::internal {
 
@@ -30,6 +32,7 @@ public:
     bool GetLatestFrame(common::AxImage& output_image) override;
     void SetFrameCallback(FrameCallback callback) override;
     void SetFrameCallback(FrameCallback callback, FrameCallbackMode mode) override;
+    VideoDecoderStats GetStats() const override;
 
 protected:
     virtual bool CreateBackend(const Mp4VideoInfo& video_info) = 0;
@@ -75,12 +78,15 @@ private:
     mutable std::mutex latest_mutex_;
     common::AxImage::Ptr latest_frame_;
 
-    std::mutex callback_mutex_;
+    mutable std::mutex callback_mutex_;
     std::condition_variable callback_cv_;
     FrameCallback frame_callback_;
     FrameCallbackMode callback_mode_{FrameCallbackMode::kLatest};
-    common::AxImage::Ptr pending_callback_frame_;
-    std::deque<common::AxImage::Ptr> callback_queue_;
+    common::internal::BoundedCallbackBuffer<common::AxImage::Ptr> callback_frames_;
+    std::atomic<std::uint64_t> received_frames_{0};
+    std::atomic<std::uint64_t> callback_enqueued_frames_{0};
+    std::atomic<std::uint64_t> callback_delivered_frames_{0};
+    std::atomic<std::uint64_t> callback_dropped_frames_{0};
 };
 
 std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder();
