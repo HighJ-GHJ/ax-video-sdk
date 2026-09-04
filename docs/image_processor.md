@@ -71,3 +71,8 @@ LRU 淘汰。布局命中后，NV12 中间画布的 padding 保持首次初始�
 
 一个 `ImageProcessor` 实例的 `Process()` 仍要求由调用方串行使用。需要多个 IVPS
 worker 时，每个并发 worker 必须拥有独立 processor，不能并发写同一缓存画布。
+
+`AXSDK_BUILD_SMOKE_TESTS=ON` 时可构建 `ax_letterbox_cache_smoke`。工具默认只做
+基线/缓存 BGR 全平面逐字节对比；显式传入 `--benchmark-iterations` 才会启用局部
+IVPS A/B 计时。计时模式按轮次交换 baseline/cached 先后顺序并报告中位每帧耗时；
+它不包含拉流、VDEC、NPU 和业务后处理，不得将结果表述为端到端加速比。
