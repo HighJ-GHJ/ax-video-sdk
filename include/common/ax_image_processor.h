@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -47,6 +48,28 @@ struct ImageProcessRequest {
     ResizeOptions resize{};
 };
 
+// 图像处理器的资源策略。容量为 0 时完全保持逐帧填充中间画布的兼容行为；
+// 大于 0 表示允许平台实现按 letterbox 布局持久复用最多指定数量的画布。
+struct ImageProcessorOptions {
+    std::size_t persistent_letterbox_workspace_capacity{0};
+};
+
+// 图像处理器的只读累计统计。统计不保存逐帧数据，也不改变处理结果。
+struct ImageProcessorStats {
+    bool persistent_workspace_supported{false};
+    std::size_t configured_capacity{0};
+    std::uint64_t eligible_requests{0};
+    std::uint64_t cache_hits{0};
+    std::uint64_t cache_misses{0};
+    std::uint64_t background_initializations{0};
+    std::uint64_t evictions{0};
+    std::uint64_t invalidations{0};
+    std::size_t current_entries{0};
+    std::size_t entries_high_watermark{0};
+    std::size_t current_cmm_bytes{0};
+    std::size_t cmm_bytes_high_watermark{0};
+};
+
 class ImageProcessor {
 public:
     virtual ~ImageProcessor() = default;
@@ -59,8 +82,12 @@ public:
     // 调用方自己准备 destination，库只负责写入内容。
     // 更适合需要复用目标缓冲、减少重复分配的场景。
     virtual bool Process(const AxImage& source, const ImageProcessRequest& request, AxImage& destination) = 0;
+    // 返回值快照可与 Process 并发读取；不返回内部画布或其他可变对象。
+    virtual ImageProcessorStats stats() const noexcept { return {}; }
 };
 
 std::unique_ptr<ImageProcessor> CreateImageProcessor();
+// 带资源策略版本；不支持持久画布的平台会在 stats() 中明确报告 unsupported。
+std::unique_ptr<ImageProcessor> CreateImageProcessor(const ImageProcessorOptions& options);
 
 }  // namespace axvsdk::common
