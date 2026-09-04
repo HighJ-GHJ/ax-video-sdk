@@ -156,7 +156,15 @@ void TestSameLayoutHitsAndLruEvictsOldest() {
     hit_c->background_valid = true;
     assert(cache.size() == 2U && cache.bytes() == 400U);
 
-    assert(cache.Insert(key_b, std::make_shared<int>(4), 400U, true) == nullptr);
+    // 错误路径可以按 Key 立即删除条目，不会留下无效资源或错误字节账本。
+    auto removed_c = cache.Remove(key_c);
+    assert(removed_c.has_value() && removed_c->resource == resource_c);
+    assert(cache.Find(key_c) == nullptr);
+    assert(cache.size() == 1U && cache.bytes() == 100U);
+    assert(!cache.Remove(key_c).has_value());
+
+    assert(cache.Insert(key_b, std::make_shared<int>(4), 400U, true) != nullptr);
+    assert(cache.Insert(key_c, std::make_shared<int>(5), 500U, true) == nullptr);
     cache.Clear();
     assert(cache.empty() && cache.bytes() == 0U);
 }

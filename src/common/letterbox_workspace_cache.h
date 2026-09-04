@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -108,6 +109,17 @@ public:
         Entry result = std::move(entries_.front());
         total_bytes_ -= result.bytes;
         entries_.erase(entries_.begin());
+        return result;
+    }
+
+    // 按 Key 移除条目并返回资源，用于“重填充失败”等必须立即释放画布的错误路径。
+    std::optional<Entry> Remove(const Key& key) {
+        const auto found = std::find_if(entries_.begin(), entries_.end(),
+                                        [&](const Entry& entry) { return entry.key == key; });
+        if (found == entries_.end()) return std::nullopt;
+        Entry result = std::move(*found);
+        total_bytes_ -= result.bytes;
+        entries_.erase(found);
         return result;
     }
 

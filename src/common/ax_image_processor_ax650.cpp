@@ -701,7 +701,12 @@ private:
         if (auto* entry = persistent_workspaces_.Find(key)) {
             stats_.RecordCacheHit();
             if (!entry->background_valid) {
-                if (!FillBackground(*entry->resource, request.resize.background_color)) return {};
+                if (!FillBackground(*entry->resource, request.resize.background_color)) {
+                    // 背景重填充失败后不保留无效 CMM 条目，避免下一帧继续命中污染画布。
+                    auto removed = persistent_workspaces_.Remove(key);
+                    if (removed) stats_.RemoveWorkspace(removed->bytes);
+                    return {};
+                }
                 entry->background_valid = true;
                 stats_.RecordBackgroundInitialization();
             }
