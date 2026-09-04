@@ -33,6 +33,10 @@ public:
         return true;
     }
 
+    ImageProcessorStats stats() const noexcept override {
+        return backend_ ? backend_->stats() : ImageProcessorStats{};
+    }
+
 private:
     std::unique_ptr<ImageProcessor> backend_;
 };
@@ -40,7 +44,11 @@ private:
 }  // namespace
 
 std::unique_ptr<ImageProcessor> CreateImageProcessor() {
-    auto backend = internal::CreatePlatformImageProcessor();
+    return CreateImageProcessor(ImageProcessorOptions{});
+}
+
+std::unique_ptr<ImageProcessor> CreateImageProcessor(const ImageProcessorOptions& options) {
+    auto backend = internal::CreatePlatformImageProcessor(options);
     return backend ? std::make_unique<MetadataPreservingImageProcessor>(std::move(backend)) : nullptr;
 }
 

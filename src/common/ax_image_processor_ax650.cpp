@@ -17,6 +17,7 @@
 
 #include "ax_image_internal.h"
 #include "common/ax_system.h"
+#include "letterbox_workspace_cache.h"
 
 namespace axvsdk::common::internal {
 
@@ -494,8 +495,18 @@ bool SameGeometryAndFormat(const AxImage& source, const AxImage& destination, co
            source.stride(1) == destination.stride(1);
 }
 
+bool SameDescriptor(const AxImage& image, const ImageDescriptor& descriptor) noexcept {
+    return image.format() == descriptor.format && image.width() == descriptor.width &&
+           image.height() == descriptor.height && image.stride(0) == descriptor.strides[0] &&
+           (descriptor.format != PixelFormat::kNv12 || image.stride(1) == descriptor.strides[1]);
+}
+
 class Ax650ImageProcessor final : public ImageProcessor {
 public:
+    explicit Ax650ImageProcessor(const ImageProcessorOptions& options)
+        : persistent_workspaces_(options.persistent_letterbox_workspace_capacity),
+          stats_(true, options.persistent_letterbox_workspace_capacity) {}
+
     AxImage::Ptr Process(const AxImage& source, const ImageProcessRequest& request) override {
         ImageDescriptor output_descriptor{};
         if (!ResolveOutputDescriptor(source, request, &output_descriptor)) {
@@ -615,19 +626,30 @@ public:
                     return false;
                 }
 
-                auto intermediate = AcquireIntermediate(intermediate_desc);
+                PersistentWorkspaceEntry* persistent_entry = nullptr;
+                common::AxImage::Ptr intermediate;
+                if (request.resize.mode == ResizeMode::kKeepAspectRatio &&
+                    persistent_workspaces_.capacity() != 0U) {
+                    intermediate = AcquirePersistentIntermediate(source, request, intermediate_desc,
+                                                                 destination.descriptor(), &persistent_entry);
+                } else {
+                    intermediate = AcquireIntermediate(intermediate_desc);
+                    if (request.resize.mode == ResizeMode::kKeepAspectRatio) {
+                        stats_.RecordEligibleRequest();
+                        if (intermediate &&
+                            FillBackground(*intermediate, request.resize.background_color)) {
+                            stats_.RecordBackgroundInitialization();
+                        } else {
+                            intermediate.reset();
+                        }
+                    }
+                }
                 if (!intermediate) {
-                    std::fprintf(stderr, "ax650 image processor: allocate intermediate failed fmt=%d size=%ux%u\n",
+                    std::fprintf(stderr,
+                                 "ax650 image processor: prepare intermediate failed fmt=%d size=%ux%u\n",
                                  static_cast<int>(intermediate_desc.format),
                                  intermediate_desc.width,
                                  intermediate_desc.height);
-                    return false;
-                }
-
-                if (request.resize.mode == ResizeMode::kKeepAspectRatio &&
-                    !FillBackground(*intermediate, request.resize.background_color)) {
-                    std::fprintf(stderr, "ax650 image processor: fill intermediate background failed fmt=%d size=%ux%u\n",
-                                 static_cast<int>(intermediate->format()), intermediate->width(), intermediate->height());
                     return false;
                 }
 
@@ -639,6 +661,9 @@ public:
                 ret = CropResizeDispatched(&src_frame_for_processing, intermediate_frame, &aspect_ratio);
                 if (ret == AX_SUCCESS) {
                     ret = CscDispatched(intermediate_frame, dst_frame);
+                }
+                if (ret != AX_SUCCESS) {
+                    InvalidatePersistentWorkspace(persistent_entry);
                 }
             }
         }
@@ -654,14 +679,78 @@ public:
         return destination.InvalidateCache();
     }
 
+    ImageProcessorStats stats() const noexcept override { return stats_.Snapshot(); }
+
 private:
+    using PersistentWorkspaceCache =
+        BoundedLruWorkspaceCache<LetterboxLayoutKey, common::AxImage::Ptr>;
+    using PersistentWorkspaceEntry = PersistentWorkspaceCache::Entry;
+
+    // 获取同布局的预填充画布。只有本函数成功返回后，条目才会进入缓存并被后续帧命中。
+    common::AxImage::Ptr AcquirePersistentIntermediate(
+        const common::AxImage& source,
+        const ImageProcessRequest& request,
+        const ImageDescriptor& intermediate_desc,
+        const ImageDescriptor& output_desc,
+        PersistentWorkspaceEntry** output_entry) {
+        if (output_entry == nullptr) return {};
+        *output_entry = nullptr;
+        stats_.RecordEligibleRequest();
+        const auto key = MakeLetterboxLayoutKey(source.descriptor(), request,
+                                                intermediate_desc, output_desc);
+        if (auto* entry = persistent_workspaces_.Find(key)) {
+            stats_.RecordCacheHit();
+            if (!entry->background_valid) {
+                if (!FillBackground(*entry->resource, request.resize.background_color)) return {};
+                entry->background_valid = true;
+                stats_.RecordBackgroundInitialization();
+            }
+            *output_entry = entry;
+            return entry->resource;
+        }
+
+        stats_.RecordCacheMiss();
+        common::AxImage::Ptr canvas;
+        if (persistent_workspaces_.size() >= persistent_workspaces_.capacity()) {
+            auto victim = persistent_workspaces_.TakeLeastRecentlyUsed();
+            if (victim) {
+                stats_.RecordEviction();
+                stats_.RemoveWorkspace(victim->bytes);
+                if (victim->resource && SameDescriptor(*victim->resource, intermediate_desc)) {
+                    canvas = std::move(victim->resource);
+                }
+            }
+        }
+
+        if (!canvas) {
+            ImageAllocationOptions options{};
+            options.memory_type = MemoryType::kCmm;
+            options.cache_mode = CacheMode::kNonCached;
+            options.alignment = 0x1000;
+            options.token = "AxImageProcessorPersistentIntermediate";
+            canvas = AxImage::Create(intermediate_desc, options);
+        }
+        if (!canvas || !FillBackground(*canvas, request.resize.background_color)) return {};
+        stats_.RecordBackgroundInitialization();
+
+        const auto bytes = canvas->byte_size();
+        auto* inserted = persistent_workspaces_.Insert(key, canvas, bytes, true);
+        if (inserted == nullptr) return {};
+        stats_.AddWorkspace(bytes);
+        *output_entry = inserted;
+        return inserted->resource;
+    }
+
+    // IVPS 失败可能只改写了画布的一部分；下次使用前必须恢复完整背景。
+    void InvalidatePersistentWorkspace(PersistentWorkspaceEntry* entry) noexcept {
+        if (entry != nullptr && entry->background_valid) {
+            entry->background_valid = false;
+            stats_.RecordInvalidation();
+        }
+    }
+
     common::AxImage::Ptr AcquireIntermediate(const common::ImageDescriptor& descriptor) {
-        if (intermediate_ &&
-            intermediate_->format() == descriptor.format &&
-            intermediate_->width() == descriptor.width &&
-            intermediate_->height() == descriptor.height &&
-            intermediate_->stride(0) == descriptor.strides[0] &&
-            (descriptor.format != PixelFormat::kNv12 || intermediate_->stride(1) == descriptor.strides[1])) {
+        if (intermediate_ && SameDescriptor(*intermediate_, descriptor)) {
             return intermediate_;
         }
 
@@ -728,12 +817,14 @@ private:
     std::mutex pool_mutex_;
     std::vector<PoolEntry> pools_;
     common::AxImage::Ptr intermediate_;
+    PersistentWorkspaceCache persistent_workspaces_;
+    AtomicImageProcessorStats stats_;
 };
 
 }  // namespace
 
-std::unique_ptr<ImageProcessor> CreatePlatformImageProcessor() {
-    return std::make_unique<Ax650ImageProcessor>();
+std::unique_ptr<ImageProcessor> CreatePlatformImageProcessor(const ImageProcessorOptions& options) {
+    return std::make_unique<Ax650ImageProcessor>(options);
 }
 
 }  // namespace axvsdk::common::internal

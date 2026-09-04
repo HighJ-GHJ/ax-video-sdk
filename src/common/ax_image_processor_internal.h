@@ -6,6 +6,6 @@
 
 namespace axvsdk::common::internal {
 
-std::unique_ptr<ImageProcessor> CreatePlatformImageProcessor();
+std::unique_ptr<ImageProcessor> CreatePlatformImageProcessor(const ImageProcessorOptions& options);
 
 }  // namespace axvsdk::common::internal

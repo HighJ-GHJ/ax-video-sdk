@@ -631,7 +631,8 @@ private:
 
 }  // namespace
 
-std::unique_ptr<ImageProcessor> CreatePlatformImageProcessor() {
+std::unique_ptr<ImageProcessor> CreatePlatformImageProcessor(const ImageProcessorOptions& options) {
+    (void)options;
     return std::make_unique<Ax620eImageProcessor>();
 }
 
