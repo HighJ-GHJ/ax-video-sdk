@@ -1,3 +1,4 @@
+// 文件说明：声明由各芯片后端实现的 ImageProcessor 内部工厂。
 #pragma once
 
 #include <memory>

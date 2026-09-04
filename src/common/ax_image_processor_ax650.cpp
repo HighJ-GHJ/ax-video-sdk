@@ -1,3 +1,4 @@
+// 文件说明：实现 AX650 IVPS 图像处理与有界持久 letterbox 中间画布。
 #include "ax_image_processor_internal.h"
 
 #include <atomic>

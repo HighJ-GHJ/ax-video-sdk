@@ -1,3 +1,4 @@
+// 文件说明：定义跨平台图像处理请求、资源策略、只读统计与工厂接口。
 #pragma once
 
 #include <cstddef>

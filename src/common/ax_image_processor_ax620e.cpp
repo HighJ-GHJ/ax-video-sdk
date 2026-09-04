@@ -1,3 +1,4 @@
+// 文件说明：实现 AX620E 图像处理后端，当前保持不支持持久画布的兼容行为。
 #include "ax_image_processor_internal.h"
 
 #include <algorithm>
