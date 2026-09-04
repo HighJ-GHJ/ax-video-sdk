@@ -294,6 +294,11 @@ if(AXSDK_BUILD_SMOKE_TESTS)
     )
     axsdk_configure_internal_tool(ax_image_processor_dump)
 
+    add_executable(ax_letterbox_cache_smoke
+        tools/ax_letterbox_cache_smoke.cpp
+    )
+    axsdk_configure_internal_tool(ax_letterbox_cache_smoke)
+
     if(NOT AXSDK_CHIP_TYPE_NORMALIZED STREQUAL "axcl")
         add_executable(ax_system_probe
             tools/ax_system_probe.cpp
