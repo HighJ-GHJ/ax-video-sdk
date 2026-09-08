@@ -1,0 +1,26 @@
+# 文件说明：独立Host跨层回归，直接编译生产解复用器，不链接AX硬件库。
+cmake_minimum_required(VERSION 3.16)
+project(axsdk_demux_reconnect_tests LANGUAGES CXX)
+enable_testing()
+set(CMAKE_CXX_STANDARD 17)
+get_filename_component(SDK_ROOT "../.." ABSOLUTE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_APPS OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(${SDK_ROOT}/third-party/rtsp-sdk rtsp)
+add_executable(demux_reconnect_test demux_reconnect_test.cpp
+    ${SDK_ROOT}/src/pipeline/ax_demuxer.cpp
+    ${SDK_ROOT}/src/codec/ax_mp4_demuxer.cpp)
+target_compile_features(demux_reconnect_test PRIVATE cxx_std_17)
+target_include_directories(demux_reconnect_test PRIVATE ${SDK_ROOT}/include
+    ${SDK_ROOT}/src/codec ${SDK_ROOT}/third-party)
+target_link_libraries(demux_reconnect_test PRIVATE rtsp-sdk)
+foreach(case control reconnect startup_failure interrupt)
+    add_test(NAME demux_${case} COMMAND demux_reconnect_test ${case})
+    set_tests_properties(demux_${case} PROPERTIES TIMEOUT 20)
+endforeach()
+set(AXSDK_TEST_MP4 "" CACHE FILEPATH "测试专用MP4，用于输入切换及Reset回归")
+if(AXSDK_TEST_MP4)
+    add_test(NAME demux_mp4_switch COMMAND demux_reconnect_test mp4 ${AXSDK_TEST_MP4})
+    set_tests_properties(demux_mp4_switch PROPERTIES TIMEOUT 20)
+endif()
