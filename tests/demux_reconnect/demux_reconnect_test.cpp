@@ -23,7 +23,7 @@ namespace {
 // 测试替身：同一监听地址接收多个会话；协议事件推进，不依赖send/recv边界一致。
 class Peer {
 public:
-    explicit Peer(bool fail_first=false) : fail_first_(fail_first) {
+    explicit Peer(bool fail_first=false,bool hold_second=false) : fail_first_(fail_first),hold_second_(hold_second) {
         listener_=socket(AF_INET,SOCK_STREAM,0); CHECK(listener_>=0);
         sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
         CHECK(bind(listener_,reinterpret_cast<sockaddr*>(&addr),sizeof(addr))==0);
@@ -37,10 +37,16 @@ public:
     // 仅关闭当前连接，监听仍可服务下一次会话。
     void Disconnect() { std::lock_guard<std::mutex> lock(mutex_); if(fd_>=0) shutdown(fd_,SHUT_RDWR); }
     unsigned Plays() { std::lock_guard<std::mutex> lock(mutex_); return plays_; }
+    // 确认重连已进入控制响应等待，再由调用线程执行Interrupt。
+    void WaitSecondDescribe() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        CHECK(event_.wait_for(lock,3s,[this]{return second_describe_;}));
+    }
     void CheckError() { std::lock_guard<std::mutex> lock(mutex_); if(error_) std::rethrow_exception(error_); }
 private:
     int listener_=-1,fd_=-1; unsigned port_=0,plays_=0,connections_=0;
-    bool fail_first_; std::atomic<bool> stop_{false}; std::mutex mutex_;
+    bool fail_first_,hold_second_,second_describe_=false;
+    std::atomic<bool> stop_{false}; std::mutex mutex_; std::condition_variable event_;
     std::thread worker_; std::exception_ptr error_;
     // 单线程发送，完整推进短写；测试退出造成的断开不是服务器脚本失败。
     static bool Send(int fd,const Bytes& data) {
@@ -72,6 +78,9 @@ private:
             }
             auto request=pending.substr(0,end+4+length); pending.erase(0,end+4+length);
             auto method=request.substr(0,request.find(' ')); auto cseq=request.find("CSeq:"); CHECK(cseq!=std::string::npos);
+            if(method=="DESCRIBE" && session==2 && hold_second_) {
+                std::lock_guard<std::mutex> lock(mutex_); second_describe_=true; event_.notify_all(); continue;
+            }
             auto seq=std::stoul(request.substr(cseq+5)); std::string body,extra;
             if(method=="DESCRIBE") {
                 body="v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=Test\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=framesize:96 320-240\r\na=control:stream\r\n";
@@ -114,15 +123,18 @@ void ReadIdentity(axvsdk::pipeline::Demuxer& demux,unsigned session) {
 int main(int argc,char** argv) {
     signal(SIGPIPE,SIG_IGN);
     try {
-        CHECK(argc>=2); std::string mode=argv[1]; Peer peer(mode=="startup_failure");
+        CHECK(argc>=2); std::string mode=argv[1]; Peer peer(mode=="startup_failure",mode=="interrupt");
         auto demux=axvsdk::pipeline::CreateDemuxer(); axvsdk::pipeline::DemuxerConfig config; config.uri=peer.Url();
         if(mode=="startup_failure")CHECK(!demux->Open(config));
         CHECK(demux->Open(config)); ReadIdentity(*demux,mode=="startup_failure"?2:1);
         if(mode=="reconnect") {
             for(unsigned next=2;next<=4;++next) { peer.Disconnect(); ReadIdentity(*demux,next); CHECK(peer.Plays()==next); }
         } else if(mode=="interrupt") {
-            peer.Disconnect(); demux->Interrupt(); axvsdk::codec::EncodedPacket packet;
-            CHECK(!demux->ReadPacket(&packet));
+            peer.Disconnect(); axvsdk::codec::EncodedPacket packet;
+            auto reading=std::async(std::launch::async,[&]{return demux->ReadPacket(&packet);});
+            try { peer.WaitSecondDescribe(); } catch(...) { demux->Interrupt(); reading.wait(); throw; }
+            demux->Interrupt();
+            CHECK(reading.wait_for(3s)==std::future_status::ready); CHECK(!reading.get());
         } else if(mode=="mp4") {
             CHECK(argc==3); config.uri=argv[2]; config.realtime_playback=false;
             CHECK(demux->Open(config)); axvsdk::codec::EncodedPacket first,again;

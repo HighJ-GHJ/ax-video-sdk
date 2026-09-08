@@ -432,8 +432,11 @@ public:
         Close();
     }
 
+    // 旧会话完整收尾前不得覆盖配置，也不能通过切换输入类型绕过关闭门禁。
     bool Open(const DemuxerConfig& config) override {
-        Close();
+        if (!CloseInternal()) {
+            return false;
+        }
 
         DemuxerInputType type = DemuxerInputType::kUnknown;
         if (!DetectDemuxerInputType(config.uri, &type)) {
@@ -484,15 +487,9 @@ public:
         return false;
     }
 
+    // 保留公共void接口；未完成收尾时保留内部状态，后续Close/Open继续尝试回收。
     void Close() noexcept override {
-        Interrupt();
-        CloseRtspSession();
-        demuxer_.reset();
-        config_ = {};
-        type_ = DemuxerInputType::kUnknown;
-        video_info_ = {};
-        stream_info_ = {};
-        ResetPlaybackState();
+        (void)CloseInternal();
     }
 
     bool ReadPacket(codec::EncodedPacket* packet) override {
@@ -634,6 +631,21 @@ public:
     }
 
 private:
+    // 返回资源是否已回收。连接断开/取消只是状态变化，不能代替join及socket回收。
+    bool CloseInternal() noexcept {
+        Interrupt();
+        if (!CloseRtspSession()) {
+            return false;
+        }
+        demuxer_.reset();
+        config_ = {};
+        type_ = DemuxerInputType::kUnknown;
+        video_info_ = {};
+        stream_info_ = {};
+        ResetPlaybackState();
+        return true;
+    }
+
     static constexpr auto kRtspKeepaliveInterval = std::chrono::seconds(15);
     static constexpr auto kRtspNoFrameRestartTimeout = std::chrono::seconds(5);
     static constexpr auto kRtspReconnectBackoffMin = std::chrono::milliseconds(200);
@@ -685,8 +697,11 @@ private:
         return static_cast<std::uint64_t>(std::max<std::int64_t>(1, duration.count()));
     }
 
+    // 每次首次连接/重连都先通过资源收尾门禁；失败由现有退避逻辑安排下一次尝试。
     bool PrepareRtspSession() noexcept {
-        CloseRtspSession();
+        if (!CloseRtspSession()) {
+            return false;
+        }
 
         rtsp::RtspClientConfig client_config{};
         client_config.prefer_tcp_transport = true;
@@ -814,15 +829,16 @@ private:
         return true;
     }
 
-    void CloseRtspSession() noexcept {
-        // Avoid spamming RTSP close logs for non-RTSP inputs (local MP4) where the client was never connected.
-        if (rtsp_client_.isConnected() || rtsp_client_.isPlaying()) {
-            rtsp_client_.interrupt();
-            (void)rtsp_client_.closeWithTimeout(2000);
+    // 只以Close返回值判断是否完成回收；Idle/Closed的重复关闭由客户端保证幂等。
+    bool CloseRtspSession() noexcept {
+        rtsp_client_.interrupt();
+        if (!rtsp_client_.closeWithTimeout(2000)) {
+            return false;
         }
         rtsp_session_ = {};
         rtsp_decoder_prefix_.clear();
         rtsp_decoder_config_sent_ = false;
+        return true;
     }
 
     void ResetPlaybackState() noexcept {
